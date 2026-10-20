@@ -14,6 +14,7 @@ function App() {
   const [isResetting, setIsResetting] = useState(false)
   const [resetMessage, setResetMessage] = useState('')
   const [resetError, setResetError] = useState('')
+  const [canResetDemo, setCanResetDemo] = useState(false)
 
   useEffect(() => {
   let cancelled = false
@@ -21,7 +22,7 @@ function App() {
   async function loadTickets() {
     try {
       const response = await fetch(
-        'http://localhost:5000/api/tickets'
+        '/api/tickets'
       )
 
       if (!response.ok) {
@@ -52,7 +53,27 @@ function App() {
     cancelled = true
   }
 }, [])
-  
+
+  // The server determines whether the signed-in user can reset demo data.
+  // Never infer admin rights from a browser-stored username or password.
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadResetPermission() {
+      try {
+        const response = await fetch('/api/health', { cache: 'no-store' })
+        if (!response.ok) throw new Error('Unable to check reset permission')
+        const data = await response.json()
+        if (!cancelled) setCanResetDemo(data.can_reset_demo === true)
+      } catch {
+        if (!cancelled) setCanResetDemo(false)
+      }
+    }
+
+    loadResetPermission()
+    return () => { cancelled = true }
+  }, [])
+
   const [showForm, setShowForm] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [form, setForm] = useState({
@@ -91,7 +112,7 @@ async function handleCreateTicket(event) {
   try {
     // Send ticket data to Express backend
     const response = await fetch(
-      'http://localhost:5000/api/tickets',
+      '/api/tickets',
       {
         method: 'POST',
         headers: {
@@ -167,7 +188,7 @@ async function handleResolveTicket(ticketId) {
 
   try {
     const response = await fetch(
-      `http://localhost:5000/api/tickets/${encodeURIComponent(ticketId)}/resolve`,
+      `/api/tickets/${encodeURIComponent(ticketId)}/resolve`,
       {
         method: 'PATCH'
       }
@@ -224,7 +245,7 @@ async function handleResetDemo() {
 
   try {
     const response = await fetch(
-      'http://localhost:5000/api/demo/reset',
+      '/api/demo/reset',
       {
         method: 'POST',
         headers: {
@@ -335,8 +356,7 @@ async function handleResetDemo() {
             >
               + Create New Ticket
             </button>
-            {import.meta.env.DEV &&
-              ['localhost', '127.0.0.1'].includes(window.location.hostname) && (
+            {canResetDemo && (
                 <button
                   type="button"
                   onClick={handleResetDemo}

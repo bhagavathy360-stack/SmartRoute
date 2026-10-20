@@ -16,7 +16,7 @@ function EngineersPanel() {
 
       try {
         const response = await fetch(
-          'http://localhost:5000/api/engineers',
+          '/api/engineers',
           { signal: controller.signal }
         )
 

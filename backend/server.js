@@ -1,4 +1,6 @@
 require('dotenv').config()
+const path = require('node:path')
+const crypto = require('node:crypto')
 const { recommendEngineers } = require('./routingAlgorithm')
 const express = require('express')
 const cors = require('cors')
@@ -6,11 +8,132 @@ const { createClient } = require('@supabase/supabase-js')
 
 const app = express()
 
-app.use(cors({
-  origin: 'http://localhost:5173'
-}))
+// Never accidentally deploy the unprotected development mode to Render.
+if (process.env.RENDER && process.env.NODE_ENV !== 'production') {
+  console.error('Set NODE_ENV=production when deploying to Render.')
+  process.exit(1)
+}
 
+// The Vite development server needs CORS. In production the app and APIs
+// are served from the same Express origin; do not enable cross-origin reads.
+if (process.env.NODE_ENV !== 'production') {
+  app.use(cors({ origin: 'http://localhost:5173' }))
+}
+
+app.disable('x-powered-by')
 app.use(express.json({ limit: '10kb' }))
+
+/*
+ * Temporary password protection for the HOSTED DEMO (not startup-grade auth).
+ * - Protects all app pages and API endpoints, not just the React UI.
+ * - An optional demo account can exercise ticket workflows, but cannot reset.
+ * - The admin account alone can reset demo records, if explicitly enabled.
+ * - Existing local development stays unchanged.
+ * All passwords are read from server-side environment variables only.
+ */
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1) // Render is one reverse proxy hop away.
+
+  const admin = {
+    role: 'admin',
+    username: process.env.DEMO_ADMIN_USERNAME || '',
+    password: process.env.DEMO_ADMIN_PASSWORD || ''
+  }
+  const viewer = {
+    role: 'demo',
+    username: process.env.DEMO_VIEWER_USERNAME || '',
+    password: process.env.DEMO_VIEWER_PASSWORD || ''
+  }
+  const hasViewerValues = Boolean(viewer.username || viewer.password)
+
+  // Fail closed: never start a public service without strong credentials.
+  if (!admin.username || admin.username.includes(':') ||
+      admin.password.length < 24 ||
+      (hasViewerValues && (!viewer.username || viewer.username.includes(':') ||
+        viewer.password.length < 24 || viewer.username === admin.username))) {
+    console.error('Invalid demo login configuration; use strong (24+ character) credentials.')
+    process.exit(1)
+  }
+
+  const accounts = hasViewerValues ? [admin, viewer] : [admin]
+  const failures = new Map()
+  const WINDOW_MS = 15 * 60 * 1000
+  const MAX_FAILURES = 12
+
+  const safeMatch = (input, expected) => crypto.timingSafeEqual(
+    crypto.createHash('sha256').update(input).digest(),
+    crypto.createHash('sha256').update(expected).digest()
+  )
+
+  app.use((req, res, next) => {
+    res.set('X-Content-Type-Options', 'nosniff')
+    res.set('X-Frame-Options', 'DENY')
+    res.set('Referrer-Policy', 'no-referrer')
+    res.set('Cache-Control', 'no-store')
+
+    const ip = req.ip
+    const now = Date.now()
+    const record = failures.get(ip)
+    if (record && record.until > now && record.count >= MAX_FAILURES) {
+      res.set('Retry-After', String(Math.ceil((record.until - now) / 1000)))
+      return res.status(429).json({ success: false, message: 'Too many login attempts' })
+    }
+    if (record && record.until <= now) failures.delete(ip)
+
+    const authorization = req.get('authorization') || ''
+    let username = ''
+    let password = ''
+    const match = /^Basic ([A-Za-z0-9+/=]+)$/.exec(authorization)
+    if (match && authorization.length <= 1024) {
+      const decoded = Buffer.from(match[1], 'base64').toString('utf8')
+      const separator = decoded.indexOf(':')
+      if (separator !== -1) {
+        username = decoded.slice(0, separator)
+        password = decoded.slice(separator + 1)
+      }
+    }
+
+    const account = accounts.find(a =>
+      safeMatch(username, a.username) && safeMatch(password, a.password)
+    )
+
+    if (!account) {
+      const current = failures.get(ip)
+      if (!current || current.until <= now) {
+        if (failures.size >= 10000) failures.delete(failures.keys().next().value)
+        failures.set(ip, { count: 1, until: now + WINDOW_MS })
+      } else {
+        current.count += 1
+      }
+      res.set('WWW-Authenticate', 'Basic realm="SmartRoute Demo", charset="UTF-8"')
+      return res.status(401).json({ success: false, message: 'Demo sign-in required' })
+    }
+    failures.delete(ip)
+    req.demoRole = account.role
+
+    // Reject cross-site browser mutations, including cross-origin forms.
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      const origin = req.get('origin')
+      let sameOrigin = false
+      try {
+        const parsedOrigin = new URL(origin)
+        const isLoopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1']
+          .includes(req.socket.remoteAddress)
+        const localTest = isLoopback && parsedOrigin.protocol === 'http:' &&
+          ['localhost', '127.0.0.1'].includes(parsedOrigin.hostname)
+        sameOrigin = parsedOrigin.host === req.get('host') &&
+          (parsedOrigin.protocol === 'https:' || localTest)
+      } catch (_) {
+        // No or malformed Origin must not authorize a browser mutation.
+      }
+      if (!sameOrigin) {
+        return res.status(403).json({ success: false, message: 'Invalid request origin' })
+      }
+    }
+
+    return next()
+  })
+}
 
 // Supabase credentials
 const supabaseUrl = process.env.SUPABASE_URL
@@ -31,9 +154,19 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 
 // API 1: Health check
 app.get('/api/health', (req, res) => {
+  // Share only the reset permission, never server-side credentials.
+  // The reset API independently checks administrator authorization.
+  const localAddresses = ['127.0.0.1', '::1', '::ffff:127.0.0.1']
+  const canResetDemo = process.env.ENABLE_DEMO_RESET === 'true' && (
+    process.env.NODE_ENV === 'production'
+      ? req.demoRole === 'admin'
+      : localAddresses.includes(req.socket.remoteAddress)
+  )
+
   res.json({
     status: 'ok',
-    message: 'SmartRoute Backend Running Successfully!'
+    message: 'SmartRoute Backend Running Successfully!',
+    can_reset_demo: canResetDemo
   })
 })
 
@@ -450,33 +583,33 @@ app.patch('/api/tickets/:id/resolve', async (req, res) => {
 })
 
  // API 8: Reset demo tickets
-// Local development only - never enable in production
+// In production, only the authenticated demo administrator can reset.
+// In local development, retain the original loopback-only protection.
 
 app.post('/api/demo/reset', async (req, res) => {
   try {
-    // Disable reset in production and unless explicitly enabled
-    if (
-      process.env.NODE_ENV === 'production' ||
-      process.env.ENABLE_DEMO_RESET !== 'true'
-    ) {
+    if (process.env.ENABLE_DEMO_RESET !== 'true') {
       return res.status(403).json({
         success: false,
         message: 'Demo reset is disabled'
       })
     }
 
-    // Only accept requests originating from this computer
-    const localAddresses = [
-      '127.0.0.1',
-      '::1',
-      '::ffff:127.0.0.1'
-    ]
-
-    if (!localAddresses.includes(req.socket.remoteAddress)) {
-      return res.status(403).json({
-        success: false,
-        message: 'Local access only'
-      })
+    if (process.env.NODE_ENV === 'production') {
+      if (req.demoRole !== 'admin') {
+        return res.status(403).json({
+          success: false,
+          message: 'Only the demo administrator can reset data'
+        })
+      }
+    } else {
+      const localAddresses = ['127.0.0.1', '::1', '::ffff:127.0.0.1']
+      if (!localAddresses.includes(req.socket.remoteAddress)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Local access only'
+        })
+      }
     }
 
     // Require explicit confirmation
@@ -516,6 +649,37 @@ app.post('/api/demo/reset', async (req, res) => {
     })
   }
 })
+
+/*
+ * Serve React frontend in production.
+ * During local development, Vite serves the frontend.
+ */
+if (process.env.NODE_ENV === 'production') {
+  const frontendDist = path.join(
+    __dirname,
+    '..',
+    'frontend',
+    'dist'
+  )
+
+  // Serve React production files
+  app.use(express.static(frontendDist))
+
+  // Support React Router page refreshes
+  app.use((req, res, next) => {
+    if (
+      req.method !== 'GET' ||
+      req.path === '/api' ||
+      req.path.startsWith('/api/')
+    ) {
+      return next()
+    }
+
+    return res.sendFile(
+      path.join(frontendDist, 'index.html')
+    )
+  })
+}
 
 // Start Express server
 const PORT = process.env.PORT || 5000

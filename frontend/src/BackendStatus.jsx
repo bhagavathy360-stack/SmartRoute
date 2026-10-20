@@ -5,7 +5,7 @@ function BackendStatus() {
   const [status, setStatus] = useState('Checking...')
 
   useEffect(() => {
-    fetch('http://localhost:5000/api/health')
+    fetch('/api/health')
       .then(response => {
         if (!response.ok) {
           throw new Error('Backend is unavailable')

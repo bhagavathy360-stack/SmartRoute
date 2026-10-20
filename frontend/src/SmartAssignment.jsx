@@ -27,7 +27,7 @@ function SmartAssignment({ tickets, onAssigned }) {
 
     try {
       const response = await fetch(
-        `http://localhost:5000/api/tickets/${encodeURIComponent(selectedId)}/recommendations`
+        `/api/tickets/${encodeURIComponent(selectedId)}/recommendations`
       )
 
       const data = await response.json()
@@ -62,7 +62,7 @@ function SmartAssignment({ tickets, onAssigned }) {
 
   try {
     const response = await fetch(
-      `http://localhost:5000/api/tickets/${encodeURIComponent(searchedTicket)}/assign`,
+      `/api/tickets/${encodeURIComponent(searchedTicket)}/assign`,
       {
         method: 'POST',
         headers: {
